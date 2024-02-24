@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 ### Changed
 - Updated reference for scan rule: Possible Username Enumeration (Issue 8262)
+- Possible Username Enumeration scan rule now uses a  comparison mechanism which should be more performant (Issue 7116)
 
 ## [51] - 2024-02-16
 ### Changed

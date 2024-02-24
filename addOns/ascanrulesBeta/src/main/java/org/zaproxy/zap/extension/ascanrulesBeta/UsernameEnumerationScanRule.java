@@ -43,11 +43,11 @@ import org.parosproxy.paros.network.HttpMessage;
 import org.parosproxy.paros.network.HttpRequestHeader;
 import org.parosproxy.paros.network.HttpStatusCode;
 import org.zaproxy.addon.commonlib.CommonAlertTag;
+import org.zaproxy.addon.commonlib.http.ComparableResponse;
 import org.zaproxy.addon.commonlib.http.HttpFieldsNames;
 import org.zaproxy.zap.authentication.FormBasedAuthenticationMethodType.FormBasedAuthenticationMethod;
 import org.zaproxy.zap.extension.authentication.ExtensionAuthentication;
 import org.zaproxy.zap.model.Context;
-import org.zaproxy.zap.utils.HirshbergMatcher;
 
 /**
  * The UsernameEnumerationScanRule identifies vulnerabilities with the login page or "forgot
@@ -74,6 +74,8 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
                     Control.getSingleton()
                             .getExtensionLoader()
                             .getExtension(ExtensionAuthentication.NAME);
+
+    private static final float SIMILARITY_THRESHOLD = 0.80f;
 
     @Override
     public int getId() {
@@ -123,19 +125,18 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
     @Override
     public void scan() {
 
-        // the technique to determine if usernames can be enumerated is as follows, using a variant
-        // of the Freiling+Schinzel method,
-        // adapted to the case where we do not know which is the username field
+        // the technique to determine if usernames can be enumerated is as follows:
         //
         // 1) Request the original URL n times. (The original URL is assumed to have a valid
-        // username, if not a valid password). Store the results in A[].
-        // 2) Compute the longest common subsequence (LCS) of A[] into LCS_A
+        // username, if not a valid password).
+        // 2) Compare all the n valid username responses.
         // 3) for each parameter in the original URL (ie, for URL params, form params, and cookie
         // params)
-        //	4) Change the current parameter (which we assume is the username parameter) to an invalid
-        // username (randomly), and request the URL n times. Store the results in B[].
-        //	5) Compute the longest common subsequence (LCS) of B[] into LCS_B
-        //	6) If LCS_A <> LCS_B, then there is a Username Enumeration issue on the current parameter
+        // 4) Change the current parameter (which we assume is the username parameter) to an invalid
+        // username (randomly), and request the URL n times.
+        // 5) Compare all the n invalid username responses.
+        // 6) If valid username response <> invalid username response, then there is a Username
+        // Enumeration issue on the current parameter
 
         try {
             boolean loginUrl = false;
@@ -187,18 +188,12 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
             }
 
             // 1) Request the original URL n times. (The original URL is assumed to have a valid
-            // username, if not a valid password). Store the results in A[].
+            // username, if not a valid password).
             // make sure to manually handle all redirects, and cookies that may be set in response.
-            // allocate enough space for the responses
 
-            StringBuilder responseA = null;
-            StringBuilder responseB = null;
-            String longestCommonSubstringA = null;
-            String longestCommonSubstringB = null;
+            HttpMessage prevMsgA = null; // previous valid username response
 
             for (int i = 0; i < numberOfRequests; i++) {
-
-                responseA = new StringBuilder(250);
 
                 HttpMessage msgCpy = getNewMsg(); // clone the request, but not the response
 
@@ -218,12 +213,6 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
                             redirectCount,
                             i,
                             numberOfRequests);
-
-                    // append the response to the responses so far for this particular instance
-                    // this will give us a complete picture of the full set of actual traffic
-                    // associated with following redirects for the request
-                    responseA.append(msgCpy.getResponseHeader().getHeadersAsString());
-                    responseA.append(msgCpy.getResponseBody().toString());
 
                     // and manually follow the redirect
                     // create a new message from scratch
@@ -323,59 +312,36 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
 
                 LOGGER.debug("Done following redirects!");
 
-                // append the response to the responses so far for this particular instance
-                // this will give us a complete picture of the full set of actual traffic associated
-                // with following redirects for the request
-                responseA.append(msgCpy.getResponseHeader().getHeadersAsString());
-                responseA.append(msgCpy.getResponseBody().toString());
+                // 2) Compare all the n valid username responses.
 
-                // 2) Compute the longest common subsequence (LCS) of A[] into LCS_A
-                // Note: in the Freiling and Schinzel method, this is calculated recursively. We
-                // calculate it iteratively, but using an equivalent method
+                if (i > 0) {
+                    ComparableResponse prevResponse = new ComparableResponse(prevMsgA, null);
+                    ComparableResponse currResponse = new ComparableResponse(msgCpy, null);
 
-                // first time in, the LCS is simple: it's the first HTML result.. no diffing
-                // required
-                if (i == 0) longestCommonSubstringA = responseA.toString();
-                // else get the LCS of the existing string, and the current result
-                else
-                    longestCommonSubstringA =
-                            this.longestCommonSubsequence(
-                                    longestCommonSubstringA, responseA.toString());
-
-                // optimisation step: if the LCS of A is 0 characters long already, then the URL
-                // output is not stable, and we can abort now, and save some time
-                if (longestCommonSubstringA.length() == 0) {
-                    // this might occur if the output returned for the URL changed mid-way. Perhaps
-                    // a CAPTCHA has fired, or a WAF has kicked in.  Let's abort now so.
-                    LOGGER.debug(
-                            "The original URL [{}] does not produce stable output (at {} of {} steps).  There is no static element in the output that can be used as a basis of comparison for the result of requesting URLs with the parameter values modified. Perhaps a CAPTCHA or WAF has kicked in!!",
-                            getBaseMsg().getRequestHeader().getURI(),
-                            i + 1,
-                            numberOfRequests);
-                    return; // we have not even got as far as looking at the parameters, so just
-                    // abort straight out of the method
+                    // optimisation step: if the response is different already, then the URL
+                    // output is not stable, and we can abort now, and save some time
+                    if (currResponse.compareWith(prevResponse) < SIMILARITY_THRESHOLD) {
+                        // this might occur if the output returned for the URL changed mid-way.
+                        // Perhaps
+                        // a CAPTCHA has fired, or a WAF has kicked in.  Let's abort now so.
+                        LOGGER.debug(
+                                "The original URL [{}] does not produce stable output (at {} of {} steps).  There is no static element in the output that can be used as a basis of comparison for the result of requesting URLs with the parameter values modified. Perhaps a CAPTCHA or WAF has kicked in!!",
+                                getBaseMsg().getRequestHeader().getURI(),
+                                i + 1,
+                                numberOfRequests);
+                        return; // we have not even got as far as looking at the parameters, so just
+                        // abort straight out of the method
+                    }
                 }
-            }
-            // get rid of any remnants of cookie setting and Date headers in the responses, as these
-            // cause false positives, and can be safely ignored
-            // replace the content length with a non-variable placeholder
-            // replace url parameters with a non-variable placeholder to eliminate tokens in URLs in
-            // the output
-            longestCommonSubstringA =
-                    longestCommonSubstringA.replaceAll("Set-Cookie:[^\\r\\n]+[\\r\\n]{1,2}", "");
-            longestCommonSubstringA =
-                    longestCommonSubstringA.replaceAll("Date:[^\\r\\n]+[\\r\\n]{1,2}", "");
-            longestCommonSubstringA =
-                    longestCommonSubstringA.replaceAll(
-                            "Content-Length:[^\\r\\n]+[\\r\\n]{1,2}", "Content-Length: XXXX\n");
-            longestCommonSubstringA =
-                    longestCommonSubstringA.replaceAll(
-                            "(?<=(&amp;|\\?)[^\\?\"=&;]+=)[^\\?\"=&;]+(?=(&amp;|\"))", "YYYY");
 
-            LOGGER.debug("The LCS of A is [{}]", longestCommonSubstringA);
+                prevMsgA = msgCpy;
+            }
 
             // 3) for each parameter in the original URL (ie, for URL params, form params, and
             // cookie params)
+
+            HttpMessage prevMsgB = null; // previous invalid username response
+
             for (Iterator<HtmlParameter> iter = htmlParams.iterator(); iter.hasNext(); ) {
 
                 HttpMessage msgModifiedParam = getNewMsg();
@@ -388,8 +354,7 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
                         currentHtmlParameter.getValue());
 
                 // 4) Change the current parameter value (which we assume is the username parameter)
-                // to an invalid username (randomly), and request the URL n times. Store the results
-                // in B[].
+                // to an invalid username (randomly), and request the URL n times.
 
                 // get a random user name the same length as the original!
                 String invalidUsername =
@@ -433,9 +398,8 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
                         numberOfRequests);
 
                 boolean continueForParameter = true;
-                for (int i = 0; i < numberOfRequests && continueForParameter; i++) {
 
-                    responseB = new StringBuilder(250);
+                for (int i = 0; i < numberOfRequests && continueForParameter; i++) {
 
                     HttpMessage msgCpy = msgModifiedParam;
 
@@ -454,13 +418,7 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
                                 i,
                                 numberOfRequests);
 
-                        // append the response to the responses so far for this particular instance
-                        // this will give us a complete picture of the full set of actual traffic
-                        // associated with following redirects for the request
-                        responseB.append(msgCpy.getResponseHeader().getHeadersAsString());
-                        responseB.append(msgCpy.getResponseBody().toString());
-
-                        // and manually follow the redirect
+                        // manually follow the redirect
                         // create a new message from scratch
                         HttpMessage msgRedirect = new HttpMessage();
 
@@ -562,84 +520,72 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
 
                     LOGGER.debug("Done following redirects!");
 
-                    // append the response to the responses so far for this particular instance
-                    // this will give us a complete picture of the full set of actual traffic
-                    // associated with following redirects for the request
-                    responseB.append(msgCpy.getResponseHeader().getHeadersAsString());
-                    responseB.append(msgCpy.getResponseBody().toString());
+                    //	5) Compare all the n invalid username responses.
 
-                    // 5) Compute the longest common subsequence (LCS) of B[] into LCS_B
-                    // Note: in the Freiling and Schinzel method, this is calculated recursively. We
-                    // calculate it iteratively, but using an equivalent method
-
-                    // first time in, the LCS is simple: it's the first HTML result.. no diffing
-                    // required
-                    if (i == 0) longestCommonSubstringB = responseB.toString();
-                    // else get the LCS of the existing string, and the current result
-                    else
-                        longestCommonSubstringB =
-                                this.longestCommonSubsequence(
-                                        longestCommonSubstringB, responseB.toString());
-
-                    // optimisation step: if the LCS of B is 0 characters long already, then the URL
+                    // optimisation step: if the response is different already, then the URL
                     // output is not stable, and we can abort now, and save some time
-                    if (longestCommonSubstringB.length() == 0) {
-                        // this might occur if the output returned for the URL changed mid-way.
-                        // Perhaps a CAPTCHA has fired, or a WAF has kicked in.  Let's abort now so.
-                        LOGGER.debug(
-                                "The modified URL [{}] (for [{}] parameter {}) does not produce stable output (after {} of {} steps). There is no static element in the output that can be used as a basis of comparison with the static output of the original query. Perhaps a CAPTCHA or WAF has kicked in!!",
-                                msgModifiedParam.getRequestHeader().getURI(),
-                                currentHtmlParameter.getType(),
-                                currentHtmlParameter.getName(),
-                                i + 1,
-                                numberOfRequests);
-                        continueForParameter = false;
-                        continue; // skip directly to the next parameter.
-                        // Note: if a CAPTCHA or WAF really has fired, the results of subsequent
-                        // iterations will likely not be accurate..
+                    if (i > 0) {
+                        ComparableResponse prevResponse = new ComparableResponse(prevMsgB, null);
+                        ComparableResponse currResponse = new ComparableResponse(msgCpy, null);
+
+                        if (currResponse.compareWith(prevResponse) < SIMILARITY_THRESHOLD) {
+                            // this might occur if the output returned for the URL changed mid-way.
+                            // Perhaps a CAPTCHA has fired, or a WAF has kicked in.  Let's abort now
+                            // so.
+                            LOGGER.debug(
+                                    "The modified URL [{}] (for [{}] parameter {}) does not produce stable output (after {} of {} steps). There is no static element in the output that can be used as a basis of comparison with the static output of the original query. Perhaps a CAPTCHA or WAF has kicked in!!",
+                                    msgModifiedParam.getRequestHeader().getURI(),
+                                    currentHtmlParameter.getType(),
+                                    currentHtmlParameter.getName(),
+                                    i + 1,
+                                    numberOfRequests);
+                            continueForParameter = false;
+                            continue; // skip directly to the next parameter.
+                            // Note: if a CAPTCHA or WAF really has fired, the results of subsequent
+                            // iterations will likely not be accurate..
+                        }
                     }
+
+                    prevMsgB = msgCpy;
                 }
 
                 // if we didn't hit something with one of the iterations for the parameter (ie, if
                 // the output when changing the param is stable),
-                // check if the parameter might be vulnerable by comparing its LCS with the
-                // original LCS for a valid login
-                if (longestCommonSubstringB != null && continueForParameter) {
-                    // get rid of any remnants of cookie setting and Date headers in the responses,
-                    // as these cause false positives, and can be safely ignored
-                    // replace the content length with a non-variable placeholder
-                    // replace url parameters with a non-variable placeholder to eliminate tokens in
-                    // URLs in the output
-                    longestCommonSubstringB =
-                            longestCommonSubstringB.replaceAll(
-                                    "Set-Cookie:[^\\r\\n]+[\\r\\n]{1,2}", "");
-                    longestCommonSubstringB =
-                            longestCommonSubstringB.replaceAll("Date:[^\\r\\n]+[\\r\\n]{1,2}", "");
-                    longestCommonSubstringB =
-                            longestCommonSubstringB.replaceAll(
-                                    "Content-Length:[^\\r\\n]+[\\r\\n]{1,2}",
-                                    "Content-Length: XXXX\n");
-                    longestCommonSubstringB =
-                            longestCommonSubstringB.replaceAll(
-                                    "(?<=(&amp;|\\?)[^\\?\"=&;]+=)[^\\?\"=&;]+(?=(&amp;|\"))",
-                                    "YYYY");
+                // check if the parameter might be vulnerable by comparing its response with the
+                // original response for a valid login
+                if (prevMsgB != null && continueForParameter) {
 
-                    LOGGER.debug("The LCS of B is [{}]", longestCommonSubstringB);
+                    //	6) If valid username response <> invalid username response, then there is a
+                    // Username Enumeration issue on the current parameter
+                    ComparableResponse validUsernameResponse =
+                            new ComparableResponse(prevMsgA, null);
+                    ComparableResponse invalidUsernameResponse =
+                            new ComparableResponse(prevMsgB, null);
 
-                    // 6) If LCS_A <> LCS_B, then there is a Username Enumeration issue on the
-                    // current parameter
-                    if (!longestCommonSubstringA.equals(longestCommonSubstringB)) {
-                        // calculate line level diffs of the 2 Longest Common Substrings to aid the
+                    StringBuilder validUsernameRes = new StringBuilder(250);
+                    validUsernameRes
+                            .append(prevMsgA.getResponseHeader().getHeadersAsString())
+                            .append(prevMsgA.getResponseBody());
+                    StringBuilder invalidUsernameRes = new StringBuilder(250);
+                    invalidUsernameRes
+                            .append(prevMsgB.getResponseHeader().getHeadersAsString())
+                            .append(prevMsgB.getResponseBody());
+
+                    if (validUsernameResponse.compareWith(invalidUsernameResponse)
+                            < SIMILARITY_THRESHOLD) {
+                        // calculate line level diffs of the 2 responses to aid the
                         // user in deciding if the match is a false positive
                         // get the diff as a series of patches
                         Patch<String> diffpatch =
                                 DiffUtils.diff(
                                         new LinkedList<>(
                                                 Arrays.asList(
-                                                        longestCommonSubstringA.split("\\n"))),
+                                                        String.valueOf(validUsernameRes)
+                                                                .split("\\n"))),
                                         new LinkedList<>(
                                                 Arrays.asList(
-                                                        longestCommonSubstringB.split("\\n"))));
+                                                        String.valueOf(invalidUsernameRes)
+                                                                .split("\\n"))));
 
                         int numberofDifferences = diffpatch.getDeltas().size();
 
@@ -715,19 +661,6 @@ public class UsernameEnumerationScanRule extends AbstractAppPlugin
     @Override
     public int getRisk() {
         return Alert.RISK_INFO;
-    }
-
-    /**
-     * gets the Longest Common Subsequence of two strings, using Dynamic programming techniques, and
-     * minimal memory
-     *
-     * @param a the first String
-     * @param b the second String
-     * @return the Longest Common Subsequence of a and b
-     */
-    public String longestCommonSubsequence(String a, String b) {
-        HirshbergMatcher hirshberg = new HirshbergMatcher();
-        return hirshberg.getLCS(a, b);
     }
 
     private boolean shouldContinue(List<Context> contextList) {
